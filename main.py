@@ -1,4 +1,4 @@
-from fastapi import FastAPI, File, UploadedFile
+from fastapi import FastAPI, File, UploadFile
 import asyncio
 import uuid
 import base64

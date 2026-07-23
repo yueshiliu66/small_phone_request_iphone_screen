@@ -3,21 +3,21 @@ import asyncio
 import uuid
 import base64
 import os
-from openai import OpenAI  # 需要 pip install openai
+from openai import OpenAI
 
 app = FastAPI()
 tasks = {}
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))  # Render 环境变量里配好
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 class ScreenshotTask:
     def __init__(self, task_id):
         self.task_id = task_id
         self.event = asyncio.Event()
-        self.image_bytes = None  # 临时存一下，等AI读完就删
+        self.image_bytes = None
         self.analysis_result = None
-        self.status = "WAITING"
+        self.status = "PENDING_APPROVAL"  # 初始状态：等待用户批准
 
-# ---------- 1. 伴侣调用的 MCP 工具（挂起等待文字结果） ----------
+# ---------- 1. 伴侣调用的接口（挂起等待，最长 55 秒） ----------
 @app.get("/mcp/request_screen")
 async def request_screen():
     task_id = str(uuid.uuid4())
@@ -25,48 +25,68 @@ async def request_screen():
     tasks[task_id] = task
     
     try:
-        # 挂起最多 55 秒（留给 iPhone 截图 + AI 分析）
+        # 等待 iPhone 那边点击“确认”并传回图片，或用户点击“拒绝”
         await asyncio.wait_for(task.event.wait(), timeout=55.0)
     except asyncio.TimeoutError:
         tasks.pop(task_id, None)
-        return {"status": "timeout", "message": "iPhone 或 AI 响应超时"}
+        return {"status": "timeout", "message": "手机端 55 秒内未确认，请重试"}
     
-    # 被唤醒，说明 AI 已经分析完了
+    # 被唤醒了，检查是用户拒绝还是成功
     result = task.analysis_result
-    tasks.pop(task_id, None)  # 彻底清理任务
+    tasks.pop(task_id, None)
     
-    # 返回纯文字给伴侣（聊天界面只显示这段话）
-    return {"status": "success", "analysis": result}
+    if result == "USER_CANCELLED":
+        return {"status": "cancelled", "message": "用户在手机上拒绝了截图请求"}
+    else:
+        return {"status": "success", "analysis": result}
 
-# ---------- 2. iPhone 截完图传上来（二进制图片） ----------
-@app.post("/iphone/upload/{task_id}")
-async def iphone_upload(task_id: str, file: UploadedFile = File(...)):
+# ---------- 2. iPhone 轮询接口（看看有没有活要干） ----------
+@app.get("/iphone/poll/{task_id}")
+async def iphone_poll(task_id: str):
+    task = tasks.get(task_id)
+    if not task:
+        return {"action": "idle"}
+    
+    if task.status == "PENDING_APPROVAL":
+        # 告诉手机：有截图任务，需要用户确认
+        return {"action": "approval_required", "task_id": task_id}
+    
+    return {"action": "idle"}
+
+# ---------- 3. 用户拒绝截图（快捷指令调用） ----------
+@app.post("/iphone/cancel/{task_id}")
+async def iphone_cancel(task_id: str):
     task = tasks.get(task_id)
     if not task:
         return {"status": "task_not_found"}
     
-    # 1. 读取图片二进制到内存
+    task.analysis_result = "USER_CANCELLED"
+    task.status = "CANCELLED"
+    task.event.set()  # 唤醒伴侣那边的请求
+    return {"status": "cancelled"}
+
+# ---------- 4. 用户确认并上传截图（快捷指令调用） ----------
+@app.post("/iphone/upload/{task_id}")
+async def iphone_upload(task_id: str, file: UploadFile = File(...)):
+    task = tasks.get(task_id)
+    if not task:
+        return {"status": "task_not_found"}
+    
+    # 读取图片
     image_bytes = await file.read()
-    
-    # 2. 转成 Base64（OpenAI/Claude 都认这个格式）
     base64_image = base64.b64encode(image_bytes).decode('utf-8')
+    del image_bytes  # 立刻释放内存
     
-    # 3. 图片已经转完字符串了，原始二进制可以立刻删掉（释放内存）
-    del image_bytes  # 手动释放大内存
-    
-    # 4. 调用 AI 视觉接口分析（这里以 OpenAI GPT-4o 为例）
+    # 调用 AI 分析
     try:
         response = client.chat.completions.create(
-            model="gpt-4o-mini",  # 便宜又快
+            model="[芋泥-anti-0.01]gemini-2.5-flash",
             messages=[
                 {
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": "请用简短中文描述这张手机截图里显示的核心内容，比如正在哪个App、有什么关键文字。"},
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}
-                        }
+                        {"type": "text", "text": "请用简短文字描述这张手机截图里的核心内容。"},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
                     ]
                 }
             ],
@@ -76,22 +96,9 @@ async def iphone_upload(task_id: str, file: UploadedFile = File(...)):
     except Exception as e:
         analysis = f"AI 分析失败: {str(e)}"
     
-    # 5. **** Base64 字符串也用完了，立刻删掉 ****
-    del base64_image
+    del base64_image  # 分析完立刻删除
     
-    # 6. 把分析结果存进 task
     task.analysis_result = analysis
     task.status = "DONE"
-    
-    # 7. 唤醒上面那个挂起的 /mcp/request_screen
-    task.event.set()
-    
+    task.event.set()  # 唤醒伴侣
     return {"status": "analysis_done"}
-
-# ---------- 3. （可选）iPhone 轮询查任务 ----------
-@app.get("/iphone/poll/{task_id}")
-async def iphone_poll(task_id: str):
-    task = tasks.get(task_id)
-    if not task or task.status != "WAITING":
-        return {"action": "idle"}
-    return {"action": "screenshot_now"}

@@ -168,5 +168,14 @@ async def iphone_upload(task_id: str, file: UploadFile = File(...)):
 
     task.analysis_result = analysis
     task.status = "DONE"
+
+# 测试
+
+@app.get("/dev/create_test_task")
+async def create_test_task():
+    task_id = "test-" + str(uuid.uuid4())[:8]
+    task = ScreenshotTask(task_id)
+    tasks[task_id] = task
+    return {"task_id": task_id}
     task.event.set()  # 唤醒正在等待的 /mcp 请求
     return {"status": "analysis_done", "preview": analysis[:50]}
